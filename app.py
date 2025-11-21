@@ -36,7 +36,7 @@ def save_leaderboard(df):
     df.to_csv(LEADERBOARD_FILE, index=False)
 
 def evaluate_model(model, pil_images, y, input_size):
-    resized_imgs = [np.array(img.resize(input_size)) / 255.0 for img in pil_images]
+    resized_imgs = [np.array(img.resize(input_size)) for img in pil_images]
     x = np.stack(resized_imgs)
     preds = model.predict(x)
     y_pred = np.argmax(preds, axis=1)
