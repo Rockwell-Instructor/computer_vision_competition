@@ -3,6 +3,7 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 import os
+import gc
 import tempfile
 from PIL import Image
 from datetime import datetime
@@ -35,13 +36,52 @@ def load_leaderboard():
 def save_leaderboard(df):
     df.to_csv(LEADERBOARD_FILE, index=False)
 
-def evaluate_model(model, pil_images, y, input_size):
-    resized_imgs = [np.array(img.resize(input_size)) for img in pil_images]
-    x = np.stack(resized_imgs)
-    preds = model.predict(x)
-    y_pred = np.argmax(preds, axis=1)
-    acc = (y_pred == y).mean()
-    return acc
+def evaluate_model_batched(model, pil_images, y_true, input_size, batch_size=32):
+    """
+    Evaluates model accuracy using batch processing to prevent Memory Spikes.
+    """
+    total_correct = 0
+    total_images = len(pil_images)
+    
+    # Create a progress bar since batching might take a moment
+    progress_bar = st.progress(0)
+    
+    # Process in chunks
+    for i in range(0, total_images, batch_size):
+        batch_indices = slice(i, i + batch_size)
+        batch_imgs = pil_images[batch_indices]
+        batch_y = y_true[batch_indices]
+        
+        # 1. Resize only this batch
+        # Note: We normalize to [0,1] immediately if your models expect float inputs. 
+        # If models expect 0-255, remove the / 255.0. 
+        # Most standard Keras models expect floats or have a Rescaling layer.
+        # For safety, we keep it as raw array matching your original logic.
+        processed_batch = [
+            np.array(img.resize(input_size)) 
+            for img in batch_imgs
+        ]
+        
+        # 2. Stack only this batch
+        x_batch = np.stack(processed_batch)
+        
+        # 3. Predict only this batch
+        # verbose=0 prevents printing to stdout which can slow down Streamlit
+        preds = model.predict(x_batch, verbose=0)
+        
+        # 4. Calculate accuracy for this batch
+        y_pred = np.argmax(preds, axis=1)
+        total_correct += np.sum(y_pred == batch_y)
+        
+        # Update progress
+        progress_bar.progress(min((i + batch_size) / total_images, 1.0))
+        
+        # 5. Manual cleanup for this loop iteration
+        del x_batch, processed_batch, preds
+    
+    progress_bar.empty() # Remove bar when done
+    
+    return total_correct / total_images
 
 st.title("Sign Language Model Showdown!")
 st.markdown("")
@@ -80,18 +120,27 @@ if submit and uploaded_file and username.strip():
         with tempfile.NamedTemporaryFile(suffix=".keras", delete=True) as tmpf:
             tmpf.write(uploaded_file.read())
             tmpf.flush()
+            
+            model = None # Initialize variable
+            
             try:
+                # Load the model
                 model = tf.keras.models.load_model(tmpf.name)
                 input_shape = model.input_shape
-                # Accept models with shape (None, H, W, 3)
+                
+                # Validation logic
                 if len(input_shape) == 4 and input_shape[-1] == 3:
-                    input_size = (input_shape[1], input_shape[2])  # (height, width)
+                    input_size = (input_shape[1], input_shape[2])
+                    
                     if None in input_size:
-                        st.error("Model input shape must have concrete dimensions, not None. Please specify fixed input size in your model.")
-                        model = None
-                    if model is not None:
+                         st.error("Model input shape must have concrete dimensions...")
+                    else:
                         try:
-                            acc = evaluate_model(model, raw_images, y_test, input_size)
+                            # Use the NEW batched evaluator
+                            acc = evaluate_model_batched(model, raw_images, y_test, input_size)
+                            
+                            # ... [Save Leaderboard Logic remains the same] ...
+                            
                             timestamp = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M:%S")
                             new_row = {
                                 "Username": username,
@@ -102,22 +151,28 @@ if submit and uploaded_file and username.strip():
                                 [leaderboard, pd.DataFrame([new_row])], ignore_index=True
                             )
                             save_leaderboard(leaderboard)
-                            st.success(
-                                f"🎉 All done! Your model scored {acc:.2%} on our test set. Your result has been added to the leaderboard."
-                            )
+                            
+                            st.success(f"🎉 All done! Score: {acc:.2%}")
+                            
                         except Exception as e:
-                            st.error(f"Model could not be run on the test set: {e}")
+                            st.error(f"Model run error: {e}")
                 else:
-                    st.error(
-                        f"Model input shape {input_shape} is not supported. "
-                        "Model must accept 3-channel (RGB) images."
-                    )
+                    st.error(f"Invalid Input Shape: {input_shape}")
+                    
             except Exception as e:
-                st.error(
-                    "Could not load your model file. "
-                    "Please ensure it is a valid Keras `.keras` file. "
-                    f"Error: {e}"
-                )
+                st.error(f"Load Error: {e}")
+                
+            finally:
+                # ==== CRITICAL MEMORY CLEANUP ====
+                if model:
+                    del model
+                
+                # 1. Clear TensorFlow Session/Graph
+                tf.keras.backend.clear_session()
+                
+                # 2. Force Python Garbage Collection
+                gc.collect()
+                
 
 elif submit and not uploaded_file:
     st.warning("Please upload your Keras `.keras` model file before submitting.")
